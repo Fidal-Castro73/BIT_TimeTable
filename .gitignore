@@ -1,0 +1,21 @@
+# Node
+node_modules/
+dist/
+build/
+.env
+.DS_Store
+
+# Vite
+.vite/
+
+# VS Code
+.vscode/
+
+# Go
+backend/main
+backend/main.exe
+backend/bin/
+
+# Project Specific
+tmp_sheet.csv
+*.log
