@@ -108,7 +108,8 @@ function SessionDetailsModal({ timetableId, day, period, onClose }) {
   const filtered = students.filter(s =>
     s.name.toLowerCase().includes(search.toLowerCase()) ||
     s.roll.toLowerCase().includes(search.toLowerCase()) ||
-    s.course_name.toLowerCase().includes(search.toLowerCase())
+    s.course_name.toLowerCase().includes(search.toLowerCase()) ||
+    (s.type && s.type.toLowerCase().includes(search.toLowerCase()))
   );
 
   return (
@@ -160,30 +161,46 @@ function SessionDetailsModal({ timetableId, day, period, onClose }) {
                   <tr>
                     <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>Roll Number</th>
                     <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>Student Name</th>
+                    <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>Type</th>
                     <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>Subject</th>
                     <th style={{ textAlign: 'left', padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>Department</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.length === 0 ? (
-                    <tr><td colSpan="4" style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>No records found matching your search.</td></tr>
+                   {filtered.length === 0 ? (
+                    <tr><td colSpan="5" style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>No records found matching your search.</td></tr>
                   ) : filtered.map((s, idx) => (
                     <tr key={idx} style={{ 
                       borderBottom: s.is_clashing ? '2px solid #F87171' : '1px solid var(--border)',
                       background: s.is_clashing ? '#FEE2E2' : 'transparent',
                       color: s.is_clashing ? '#991B1B' : 'inherit',
-                      transition: 'all 0.2s'
+                      transition: 'all 0.2s',
                     }}>
                       <td style={{ padding: '12px 16px', fontWeight: 700, color: s.is_clashing ? '#B91C1C' : 'var(--primary)' }}>
-                        {s.roll}
-                        {s.is_clashing && <span title="CONFLICT: This student is scheduled for another exam in this session!" style={{ marginLeft: 6, cursor: 'help', fontSize: 16 }}>⚠️</span>}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          {s.is_clashing && <span className="clash-badge">CLASH</span>}
+                          {s.roll}
+                        </div>
                       </td>
-                      <td style={{ padding: '12px 16px', fontWeight: 600 }}>{s.name}</td>
+                      <td style={{ padding: '12px 16px', fontWeight: s.is_clashing ? 800 : 600 }}>{s.name}</td>
                       <td style={{ padding: '12px 16px' }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.6 }}>{s.course_code}</div>
-                        <div style={{ fontWeight: s.is_clashing ? 900 : 400 }}>{s.course_name}</div>
+                         <span style={{ 
+                           padding: '2px 8px', 
+                           borderRadius: 12, 
+                           fontSize: 10, 
+                           fontWeight: 800,
+                           background: s.type === 'Regular' ? '#DBEAFE' : '#FFEDD5',
+                           color: s.type === 'Regular' ? '#1E40AF' : '#9A3412',
+                           textTransform: 'uppercase'
+                         }}>
+                           {s.type}
+                         </span>
+                       </td>
+                      <td style={{ padding: '12px 16px' }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.8 }}>{s.course_code}</div>
+                        <div style={{ fontWeight: s.is_clashing ? 800 : 400 }}>{s.course_name}</div>
                       </td>
-                      <td style={{ padding: '12px 16px', fontSize: 12 }}>{s.dept}</td>
+                      <td style={{ padding: '12px 16px', fontSize: 12, fontWeight: s.is_clashing ? 700 : 400 }}>{s.dept}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -292,7 +309,10 @@ export default function Dashboard({ timetableId, onApproved, onRejected, onViewC
     return mismatch;
   };
 
-  const getSlotConflict = (id) => !!clashingIds[id];
+  const getSlotConflict = (id) => {
+    if (!clashingIds) return false;
+    return !!clashingIds[id] || !!clashingIds[String(id)];
+  };
 
   const getSlotMismatch = (chkSlot) => {
     if (!timetable?.day_config) return false;
@@ -319,6 +339,7 @@ export default function Dashboard({ timetableId, onApproved, onRejected, onViewC
       .then(d => {
         if (d.success) {
           setSlots(d.slots || []);
+          console.log("DEBUG: Clashing IDs from Backend:", d.clashing_ids);
           setClashingIds(d.clashing_ids || {});
           if (initialSlots.length === 0) setInitialSlots(JSON.parse(JSON.stringify(d.slots || [])));
 

@@ -22,7 +22,8 @@ type CourseInfo struct {
 	Strength     int
 	RegulationID int
 	UploadType   string
-	StudentSet   map[string]bool
+	StudentSet   map[string]bool // THE ROSTER (Who writes the exam in this session)
+	ClashSet     map[string]bool // THE SHADOW (Everyone in the course, used for safety)
 }
 
 // SlotCourse represents a single (possibly clubbed) course entry in a slot
@@ -32,7 +33,9 @@ type SlotCourse struct {
 	Strength    int
 	Departments []string
 	Semesters   []int
-	StudentSets []map[string]bool // one per code
+	StudentSets []map[string]bool // one per code (The Roster)
+	ClashSets   []map[string]bool // one per code (The Safety Set)
+	Type        string            // "Regular" or "Arrear"
 }
 
 // ScheduleSlot is one session in the final timetable
@@ -118,11 +121,15 @@ func loadCourses(db *sql.DB, regulationID int, uploadType string) ([]CourseInfo,
 			continue
 		}
 
-		// Load student set for clash detection
-		studentSet, err := clash.GetStudentSet(db, c.CourseCode, regulationID, uploadType)
-		if err == nil {
-			c.StudentSet = studentSet
-		}
+		// Safety logic: We always load the FULL roster for clash detection (ClashSet)
+		// but we only load the target category for the session roster (StudentSet)
+		fullSet, _ := clash.GetStudentSet(db, c.CourseCode, regulationID, false)
+		c.ClashSet = fullSet
+
+		isArrOnly := uploadType == "Arrear"
+		catSet, _ := clash.GetStudentSet(db, c.CourseCode, regulationID, isArrOnly)
+		c.StudentSet = catSet
+		c.Strength = len(catSet)
 		courses = append(courses, c)
 	}
 
@@ -200,6 +207,12 @@ func mergeByName(courses []CourseInfo) []CourseInfo {
 			}
 			for reg := range c.StudentSet {
 				m.StudentSet[reg] = true
+			}
+			if m.ClashSet == nil {
+				m.ClashSet = make(map[string]bool)
+			}
+			for reg := range c.ClashSet {
+				m.ClashSet[reg] = true
 			}
 
 			// Use unique headcount for merged strength
@@ -352,8 +365,11 @@ func sortCoursesArrear(courses []CourseInfo, order string) []CourseInfo {
 // canClubWith checks if a candidate course can share a session with all already-placed courses
 func canClubWith(candidate CourseInfo, slotCourses []SlotCourse) bool {
 	for _, sc := range slotCourses {
-		for _, existingSet := range sc.StudentSets {
-			if clash.HasClash(candidate.StudentSet, existingSet) {
+		for i, existingSet := range sc.ClashSets {
+			if clash.HasClash(candidate.ClashSet, existingSet) {
+				intersection := clash.Intersection(candidate.ClashSet, existingSet)
+				fmt.Printf("🛑 CLASH DETECTED: %s vs %s | Student: %s (and %d others)\n", 
+					candidate.CourseCode, sc.CourseCodes[i], intersection[0], len(intersection)-1)
 				return false
 			}
 		}
@@ -417,9 +433,9 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 	regCourses = sortCoursesRegular(regCourses, options.Regular)
 	arrCourses = sortCoursesArrear(arrCourses, options.Arrear)
 
-	// Track which courses are scheduled
-	regScheduled := make([]bool, len(regCourses))
-	arrScheduled := make([]bool, len(arrCourses))
+	// Track which courses are scheduled (Map by Course Code)
+	regScheduled := make(map[string]bool)
+	arrScheduled := make(map[string]bool)
 	totalScheduled := 0
 	totalToSchedule := len(regCourses) + len(arrCourses)
 
@@ -473,18 +489,19 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 
 		// Use the correct pool based on targetType
 		var pool []CourseInfo
-		var scheduled []bool
+		var scheduledMap *map[string]bool
 		if targetType == "Regular" {
 			pool = regCourses
-			scheduled = regScheduled
+			scheduledMap = &regScheduled
 		} else {
 			pool = arrCourses
-			scheduled = arrScheduled
+			scheduledMap = &arrScheduled
 		}
 
 		// --- Pass 1: Primary Semesters (S1-S4) ---
-		for i, course := range pool {
-			if scheduled[i] {
+		for i := 0; i < len(pool); i++ {
+			course := pool[i]
+			if (*scheduledMap)[course.CourseCode] {
 				continue
 			}
 			// Check semester eligibility
@@ -524,17 +541,22 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 					Departments: []string{course.Department},
 					Semesters:   course.Semesters,
 					StudentSets: []map[string]bool{course.StudentSet},
+					ClashSets:   []map[string]bool{course.ClashSet},
+					Type:        targetType,
 				})
 			}
 
-			scheduled[i] = true
+			(*scheduledMap)[course.CourseCode] = true
 			totalScheduled++
 			
-			// Commit state back (Go slices refs...)
+			// Commit state back (Dual-Category Logic)
 			if targetType == "Regular" {
-				regScheduled[i] = true
+				// If we scheduled it as Regular, it's done for BOTH categories
+				regScheduled[course.CourseCode] = true
+				arrScheduled[course.CourseCode] = true
 			} else {
-				arrScheduled[i] = true
+				// If we scheduled it as Arrear, only Arrears are satisfied
+				arrScheduled[course.CourseCode] = true
 			}
 
 			// --- STANDALONE LOGIC ---
@@ -548,17 +570,21 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 				// Re-verify if this was an 'Extra' course?
 				// To keep it simple and robust, we check if this department is still a leader.
 				curDeptCount := 0
-				for idx, c := range pool {
-					if !scheduled[idx] && c.Department == course.Department {
+				for _, c := range pool {
+					if !(*scheduledMap)[c.CourseCode] && c.Department == course.Department {
 						curDeptCount++
 					}
 				}
 				// If this dept has more courses left than others, it's a leader.
 				isLeader := false
-				for idx, c := range pool {
-					if !scheduled[idx] && c.Department != course.Department {
+				for _, c := range pool {
+					if !(*scheduledMap)[c.CourseCode] && c.Department != course.Department {
 						otherCount := 0
-						for k, c2 := range pool { if !scheduled[k] && c2.Department == c.Department { otherCount++ } }
+						for _, c2 := range pool {
+							if !(*scheduledMap)[c2.CourseCode] && c2.Department == c.Department {
+								otherCount++
+							}
+						}
 						if curDeptCount > otherCount {
 							isLeader = true
 							break
@@ -577,17 +603,18 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 		if config.Mode == 5 && config.ExtraSem > 0 && len(slot.Courses) == 0 {
 			// Try to fill from the correct pool (ExtraType)
 			var extraPool []CourseInfo
-			var extraScheduled []bool
+			var extraScheduledMap *map[string]bool
 			if config.ExtraType == "Regular" {
 				extraPool = regCourses
-				extraScheduled = regScheduled
+				extraScheduledMap = &regScheduled
 			} else {
 				extraPool = arrCourses
-				extraScheduled = arrScheduled
+				extraScheduledMap = &arrScheduled
 			}
 
-			for i, course := range extraPool {
-				if extraScheduled[i] {
+			for i := 0; i < len(extraPool); i++ {
+				course := extraPool[i]
+				if (*extraScheduledMap)[course.CourseCode] {
 					continue
 				}
 				isExtra := false
@@ -628,15 +655,20 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 						Departments: []string{course.Department},
 						Semesters:   course.Semesters,
 						StudentSets: []map[string]bool{course.StudentSet},
+						ClashSets:   []map[string]bool{course.ClashSet},
+						Type:        config.ExtraType,
 					})
 				}
 				
-				extraScheduled[i] = true
+				(*extraScheduledMap)[course.CourseCode] = true
 				totalScheduled++
+
+				// Commit state back (Dual-Category Logic)
 				if config.ExtraType == "Regular" {
-					regScheduled[i] = true
+					regScheduled[course.CourseCode] = true
+					arrScheduled[course.CourseCode] = true
 				} else {
-					arrScheduled[i] = true
+					arrScheduled[course.CourseCode] = true
 				}
 			}
 		}

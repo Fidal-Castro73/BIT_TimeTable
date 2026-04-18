@@ -19,3 +19,14 @@ backend/bin/
 # Project Specific
 tmp_sheet.csv
 *.log
+
+# Excel & Sensitive Data
+*.xlsx
+*.xls
+*.xlsb
+*.xlsm
+*.csv
+# Ignore folders that might store uploaded sheets
+uploads/
+data/*.xlsx
+data/*.csv

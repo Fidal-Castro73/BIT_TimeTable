@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -97,6 +98,7 @@ func initDB() {
 
 	// Dynamic Schema Update: Ensure 'semesters' column exists if the table was created previously
 	db.Exec("ALTER TABLE timetable_slots ADD COLUMN semesters TEXT AFTER departments")
+	db.Exec("ALTER TABLE timetable_slots ADD COLUMN session_type VARCHAR(50) AFTER semesters")
 
 	// 11. Database Deep Scrub (One-time Migration)
 	// Optimized: Only run on rows that actually need cleaning to save time on startup
@@ -452,8 +454,8 @@ func generateHandler(c *gin.Context) {
 			}
 			sems := strings.Join(semBatch, ",")
 
-			_, err = db.Exec(`INSERT INTO timetable_slots (timetable_id, day_number, session, course_codes, course_name, strength, departments, semesters) VALUES (?,?,?,?,?,?,?,?)`,
-				timetableID, slot.DayNumber, slot.Session, codes, sc.CourseName, sc.Strength, depts, sems)
+			_, err = db.Exec(`INSERT INTO timetable_slots (timetable_id, day_number, session, course_codes, course_name, strength, departments, semesters, session_type) VALUES (?,?,?,?,?,?,?,?,?)`,
+				timetableID, slot.DayNumber, slot.Session, codes, sc.CourseName, sc.Strength, depts, sems, sc.Type)
 			if err != nil {
 				log.Println("Slot insert error:", err)
 			}
@@ -692,7 +694,8 @@ func getTimetableHandler(c *gin.Context) {
 	}
 
 	for _, sSlots := range sessionMap {
-		if len(sSlots) < 2 { continue }
+		// Even if there's only 1 card in a session, it could have internal clashes (clubbed courses)
+		// so we must check all sessions.
 
 		// 1. Gather all course codes in this session
 		var sessionCodes []string
@@ -702,44 +705,53 @@ func getTimetableHandler(c *gin.Context) {
 
 		// 2. Fetch all student records for these codes in one go
 		placeholders := make([]string, len(sessionCodes))
-		args := []interface{}{tt.RegulationID, tt.UploadType}
+		args := []interface{}{tt.RegulationID}
 		for i, c := range sessionCodes { placeholders[i] = "?"; args = append(args, strings.TrimSpace(c)) }
 
-		q := fmt.Sprintf(`SELECT register_no, course_code FROM student_data WHERE regulation_id=? AND upload_type=? AND course_code IN (%s)`, strings.Join(placeholders, ","))
+		q := fmt.Sprintf(`SELECT register_no, course_code FROM student_data WHERE regulation_id=? AND course_code IN (%s)`, strings.Join(placeholders, ","))
 		rows, err := db.Query(q, args...)
 		if err != nil { continue }
 
 		// 3. Map students to slot IDs
 		// studentToSlots[regNo] = [slotID1, slotID2...]
+		studentCountsInSession := make(map[string]int)
 		studentToSlots := make(map[string][]int)
+		
 		for rows.Next() {
 			var reg, code string
 			rows.Scan(&reg, &code)
 			cleanCode := strings.TrimSpace(code)
+			studentCountsInSession[reg]++
+			
 			for _, slot := range sSlots {
-				if strings.Contains(slot.CourseCodes, cleanCode) {
+				// Use exact match check for codes within comma-sep string
+				found := false
+				for _, c := range strings.Split(slot.CourseCodes, ",") {
+					if strings.TrimSpace(c) == cleanCode {
+						found = true
+						break
+					}
+				}
+				if found {
 					studentToSlots[reg] = append(studentToSlots[reg], slot.ID)
 				}
 			}
 		}
-		rows.Close() // Explicitly close rows within the loop
+		rows.Close()
 
-		// 4. Identify clashing slot IDs (if a student is in different slot IDs in the same session)
-		for _, slotIDs := range studentToSlots {
-			if len(slotIDs) < 2 { continue }
-			// Check if there are at least two DIFFERENT slot IDs
-			first := slotIDs[0]
-			hasDifferent := false
-			for _, sid := range slotIDs[1:] {
-				if sid != first {
-					hasDifferent = true
-					break
+		// 4. Identify clashing slot IDs
+		for reg, count := range studentCountsInSession {
+			if count > 1 {
+				fmt.Printf("   [DASHBOARD-CLASH] Student %s found %d times in session. Flagging slots: %v\n", reg, count, studentToSlots[reg])
+				for _, sid := range studentToSlots[reg] {
+					clashingIDs[sid] = true
 				}
 			}
-			if hasDifferent {
-				for _, sid := range slotIDs { clashingIDs[sid] = true }
-			}
 		}
+	}
+
+	if len(clashingIDs) > 0 {
+		fmt.Printf("🛡️ UI FEEDBACK: Flagging %d clashing slot(s) for visual glow\n", len(clashingIDs))
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -971,7 +983,7 @@ func getSessionStudentsHandler(c *gin.Context) {
 
 	// 2. Get Courses for this session
 	rows, err := db.Query(`
-		SELECT course_codes FROM timetable_slots 
+		SELECT course_codes, session_type FROM timetable_slots 
 		WHERE timetable_id = ? AND day_number = ? AND session = ?
 	`, id, day, period)
 	if err != nil {
@@ -981,9 +993,11 @@ func getSessionStudentsHandler(c *gin.Context) {
 	defer rows.Close()
 
 	var allCodes []string
+	var sessionType string
 	for rows.Next() {
-		var codes string
-		rows.Scan(&codes)
+		var codes, sType string
+		rows.Scan(&codes, &sType)
+		sessionType = sType
 		if codes != "" {
 			parts := strings.Split(codes, ",")
 			for _, p := range parts {
@@ -1015,17 +1029,24 @@ func getSessionStudentsHandler(c *gin.Context) {
 		args = append(args, code)
 	}
 
-	query := fmt.Sprintf(`
-		SELECT student_name, register_no, course_code, course_name, department 
+	queryStr := `
+		SELECT student_name, register_no, course_code, course_name, department, upload_type
 		FROM student_data 
 		WHERE regulation_id = ? 
+	`
+
+	if sessionType == "Arrear" {
+		queryStr += " AND upload_type = 'Arrear' "
+	}
+
+	queryStr += fmt.Sprintf(`
 		  AND (
 			TRIM(UPPER(course_code)) IN (%s)
 			OR TRIM(REPLACE(UPPER(course_code), '-', '')) IN (%s)
 		  )
 		ORDER BY register_no`, strings.Join(placeholders, ","), strings.Join(placeholders, ","))
 
-	studentRows, err := db.Query(query, append(args, args[1:]...)...)
+	studentRows, err := db.Query(queryStr, append(args, args[1:]...)...)
 	if err != nil {
 		fmt.Printf("❌ SQL Query Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Query failed"})
@@ -1039,13 +1060,14 @@ func getSessionStudentsHandler(c *gin.Context) {
 		CourseCode string `json:"course_code"`
 		CourseName string `json:"course_name"`
 		Dept       string `json:"dept"`
+		Type       string `json:"type"`
 		IsClashing bool   `json:"is_clashing"`
 	}
 	var results []StudentDetail
 	regCounts := make(map[string]int)
 	for studentRows.Next() {
-		var name, roll, code, cname, dept sql.NullString
-		if err := studentRows.Scan(&name, &roll, &code, &cname, &dept); err != nil {
+		var name, roll, code, cname, dept, utype sql.NullString
+		if err := studentRows.Scan(&name, &roll, &code, &cname, &dept, &utype); err != nil {
 			fmt.Printf("⚠️ Scan Skip: %v\n", err)
 			continue
 		}
@@ -1056,17 +1078,38 @@ func getSessionStudentsHandler(c *gin.Context) {
 			CourseCode: code.String,
 			CourseName: cname.String,
 			Dept:       dept.String,
+			Type:       utype.String,
 		}
 		results = append(results, s)
 		regCounts[s.Roll]++
 	}
 
 	// Dynamic Clash Calculation
-	clashCount := 0
+	uniqueClashes := make(map[string]bool)
 	for i := range results {
 		if regCounts[results[i].Roll] > 1 {
 			results[i].IsClashing = true
-			clashCount++
+			uniqueClashes[results[i].Roll] = true
+		}
+	}
+	clashCount := len(uniqueClashes)
+
+	// Sort by IsClashing (Descending: true comes before false)
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].IsClashing && !results[j].IsClashing {
+			return true
+		}
+		if !results[i].IsClashing && results[j].IsClashing {
+			return false
+		}
+		return strings.Compare(results[i].Roll, results[j].Roll) < 0
+	})
+
+	// Logging unique clashing student names
+	if clashCount > 0 {
+		fmt.Printf("⚠️ WARNING: FOUND %d UNIQUE CLASHING STUDENTS in Day %s Session %s\n", clashCount, day, period)
+		for roll := range uniqueClashes {
+			fmt.Printf("   - [CLASH] Roll: %s\n", roll)
 		}
 	}
 

@@ -5,12 +5,13 @@ import (
 )
 
 // GetStudentSet returns a set of register_nos for a given course_code and regulation_id
-func GetStudentSet(db *sql.DB, courseCode string, regulationID int, uploadType string) (map[string]bool, error) {
-	rows, err := db.Query(
-		`SELECT DISTINCT register_no FROM student_data 
-		 WHERE course_code = ? AND regulation_id = ? AND upload_type = ?`,
-		courseCode, regulationID, uploadType,
-	)
+func GetStudentSet(db *sql.DB, courseCode string, regulationID int, onlyArrear bool) (map[string]bool, error) {
+	query := `SELECT DISTINCT register_no FROM student_data 
+		 WHERE course_code = ? AND regulation_id = ?`
+	if onlyArrear {
+		query += " AND upload_type = 'Arrear'"
+	}
+	rows, err := db.Query(query, courseCode, regulationID)
 	if err != nil {
 		return nil, err
 	}
