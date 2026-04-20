@@ -18,7 +18,9 @@ backend/bin/
 
 # Project Specific
 tmp_sheet.csv
+backend/out.txt
 *.log
+*.exe
 
 # Excel & Sensitive Data
 *.xlsx
