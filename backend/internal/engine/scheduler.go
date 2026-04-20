@@ -24,6 +24,12 @@ type CourseInfo struct {
 	UploadType   string
 	StudentSet   map[string]bool // THE ROSTER (Who writes the exam in this session)
 	ClashSet     map[string]bool // THE SHADOW (Everyone in the course, used for safety)
+
+	// Advanced tracking for dynamic roster construction
+	CodeToGlobal map[string]map[string]bool
+	CodeToArrear map[string]map[string]bool
+	CodeToSem    map[string]int
+	CodeToDept   map[string]string
 }
 
 // SlotCourse represents a single (possibly clubbed) course entry in a slot
@@ -121,15 +127,38 @@ func loadCourses(db *sql.DB, regulationID int, uploadType string) ([]CourseInfo,
 			continue
 		}
 
-		// Safety logic: We always load the FULL roster for clash detection (ClashSet)
-		// but we only load the target category for the session roster (StudentSet)
+		// Setup advanced map tracking
+		cleanCode := CleanCourseCode(c.CourseCode)
+		// fullSet = EVERYONE for this code regardless of upload type/semester
+		// Used for CodeToGlobal so Primary Sem includes both Regular and Arrear students.
+		// The Semester Firewall in dynRoster building then blocks wrong-semester Regulars.
 		fullSet, _ := clash.GetStudentSet(db, c.CourseCode, regulationID, false)
-		c.ClashSet = fullSet
+		// arrSet = only Arrear students for this code (for Arrear-visitor enrollment)
+		arrSet, _ := clash.GetStudentSet(db, c.CourseCode, regulationID, true)
+		// regSet = only same-pool students, for correct initial strength count
+		regSet, _ := clash.GetStudentSetForUploadType(db, c.CourseCode, regulationID, uploadType, c.Semester)
 
-		isArrOnly := uploadType == "Arrear"
-		catSet, _ := clash.GetStudentSet(db, c.CourseCode, regulationID, isArrOnly)
-		c.StudentSet = catSet
-		c.Strength = len(catSet)
+		c.CodeToGlobal = make(map[string]map[string]bool)
+		c.CodeToArrear = make(map[string]map[string]bool)
+		c.CodeToSem = make(map[string]int)
+		c.CodeToDept = make(map[string]string)
+
+		// CodeToGlobal uses fullSet so that in a Regular session, S4 Arrears
+		// can still join S4 Regulars. The Semester Firewall (in Generate)
+		// handles blocking S6 Regular students from appearing.
+		c.CodeToGlobal[cleanCode] = fullSet
+		c.CodeToArrear[cleanCode] = arrSet
+		c.CodeToSem[cleanCode] = c.Semester
+		c.CodeToDept[cleanCode] = c.Department
+
+		c.ClashSet = fullSet
+		// StudentSet: use regSet for accurate strength; Arrear pool uses arrSet
+		if uploadType == "Arrear" {
+			c.StudentSet = arrSet
+		} else {
+			c.StudentSet = regSet
+		}
+		c.Strength = len(c.StudentSet)
 		courses = append(courses, c)
 	}
 
@@ -214,6 +243,17 @@ func mergeByName(courses []CourseInfo) []CourseInfo {
 			for reg := range c.ClashSet {
 				m.ClashSet[reg] = true
 			}
+
+			// Merge advanced maps
+			if m.CodeToGlobal == nil { m.CodeToGlobal = make(map[string]map[string]bool) }
+			if m.CodeToArrear == nil { m.CodeToArrear = make(map[string]map[string]bool) }
+			if m.CodeToSem == nil { m.CodeToSem = make(map[string]int) }
+			if m.CodeToDept == nil { m.CodeToDept = make(map[string]string) }
+
+			for code, rmap := range c.CodeToGlobal { m.CodeToGlobal[code] = rmap }
+			for code, rmap := range c.CodeToArrear { m.CodeToArrear[code] = rmap }
+			for code, sem := range c.CodeToSem { m.CodeToSem[code] = sem }
+			for code, dept := range c.CodeToDept { m.CodeToDept[code] = dept }
 
 			// Use unique headcount for merged strength
 			m.Strength = len(m.StudentSet)
@@ -433,9 +473,42 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 	regCourses = sortCoursesRegular(regCourses, options.Regular)
 	arrCourses = sortCoursesArrear(arrCourses, options.Arrear)
 
+	// SEMESTER FIREWALL: find each Regular student's NATIVE semester
+	// (the semester where they have the most course enrollments).
+	// Used to definitively block e.g. S6 Regular students from appearing
+	// in S4 sessions, regardless of per-code logic.
+	// We store: roll -> native_semester (ONE value per student).
+	studentNativeSem := make(map[string]int)
+	{
+		rows, err := db.Query(`
+			SELECT register_no, semester, COUNT(*) as cnt
+			FROM student_data
+			WHERE regulation_id = ? AND upload_type = 'Regular'
+			GROUP BY register_no, semester
+			ORDER BY register_no, cnt DESC`, regulationID)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var roll string
+				var sem, cnt int
+				if rows.Scan(&roll, &sem, &cnt) == nil {
+					// Only store the first (highest-count) semester per student
+					if _, exists := studentNativeSem[roll]; !exists {
+						studentNativeSem[roll] = sem
+					}
+				}
+			}
+		}
+	}
+
 	// Track which courses are scheduled (Map by Course Code)
 	regScheduled := make(map[string]bool)
 	arrScheduled := make(map[string]bool)
+	// perCourseScheduled: courseName -> set of rolls already placed for that specific course.
+	// This prevents the same student from writing the same exam TWICE (e.g., once in an Arrear
+	// session and again in a Regular session for the same-named course).
+	// It does NOT block students from their other courses across other days.
+	perCourseScheduled := make(map[string]map[string]bool)
 	totalScheduled := 0
 	totalToSchedule := len(regCourses) + len(arrCourses)
 
@@ -489,21 +562,22 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 
 		// Use the correct pool based on targetType
 		var pool []CourseInfo
-		var scheduledMap *map[string]bool
 		if targetType == "Regular" {
 			pool = regCourses
-			scheduledMap = &regScheduled
 		} else {
 			pool = arrCourses
-			scheduledMap = &arrScheduled
 		}
 
 		// --- Pass 1: Primary Semesters (S1-S4) ---
 		for i := 0; i < len(pool); i++ {
 			course := pool[i]
-			if (*scheduledMap)[course.CourseCode] {
+			courseKey := strings.ToUpper(strings.TrimSpace(course.CourseName))
+			alreadyInCourse := perCourseScheduled[courseKey] // nil map is safe for reads
+
+			if isCourseScheduled(course, targetType, regScheduled, arrScheduled) {
 				continue
 			}
+
 			// Check semester eligibility
 			semMatch := false
 			for _, sem := range course.Semesters {
@@ -516,6 +590,90 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 				continue
 			}
 
+			// -- DYNAMIC ROSTER RECONSTRUCTION --
+			dynRoster := make(map[string]bool)
+			presentCodesMap := make(map[string]bool)
+
+			for code, baseSem := range course.CodeToSem {
+				codeContributed := false
+				if targetType == "Regular" {
+					if validSemSet[baseSem] { // Primary Sem
+						if !regScheduled[code] {
+							for s := range course.CodeToGlobal[code] {
+								if alreadyInCourse[s] { continue } // already wrote THIS course
+								if nativeSem, isRegular := studentNativeSem[s]; isRegular {
+									if !validSemSet[nativeSem] { continue }
+								}
+								dynRoster[s] = true
+								codeContributed = true
+							}
+						}
+					} else { // Secondary Sem
+						if !arrScheduled[code] {
+							for s := range course.CodeToArrear[code] {
+								if !alreadyInCourse[s] { 
+									dynRoster[s] = true 
+									codeContributed = true
+								}
+							}
+						}
+					}
+				} else { // Arrear session
+					if !arrScheduled[code] {
+						for s := range course.CodeToArrear[code] {
+							if !alreadyInCourse[s] { 
+								dynRoster[s] = true 
+								codeContributed = true
+							}
+						}
+					}
+				}
+				if codeContributed {
+					presentCodesMap[code] = true
+				}
+			}
+
+			// Construct the list of codes, semesters, and depts actually present in this session
+			var activeCodes []string
+			activeSemMap := make(map[int]bool)
+			activeDeptMap := make(map[string]bool)
+
+			for code := range presentCodesMap {
+				activeCodes = append(activeCodes, code)
+				if sem, ok := course.CodeToSem[code]; ok {
+					activeSemMap[sem] = true
+				}
+				if dept, ok := course.CodeToDept[code]; ok {
+					// Handle comma separated departments
+					for _, d := range strings.Split(dept, ",") {
+						activeDeptMap[strings.TrimSpace(d)] = true
+					}
+				}
+			}
+			
+			var activeSemesters []int
+			for sem := range activeSemMap {
+				activeSemesters = append(activeSemesters, sem)
+			}
+			var activeDepartments []string
+			for dept := range activeDeptMap {
+				activeDepartments = append(activeDepartments, dept)
+			}
+
+			// Fallback: if somehow empty but we allow placement
+			if len(activeCodes) == 0 && len(dynRoster) > 0 {
+				activeCodes = strings.Split(course.CourseCode, "+")
+				activeSemesters = course.Semesters
+				activeDepartments = strings.Split(course.Department, ", ")
+			}
+
+			if len(dynRoster) == 0 {
+				continue
+			}
+
+			course.StudentSet = dynRoster
+			course.Strength = len(dynRoster)
+
 			if !canClubWith(course, slot.Courses) {
 				continue
 			}
@@ -524,9 +682,10 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 			clubbed := false
 			for sci := range slot.Courses {
 				if strings.EqualFold(slot.Courses[sci].CourseName, course.CourseName) {
-					slot.Courses[sci].CourseCodes = append(slot.Courses[sci].CourseCodes, course.CourseCode)
-					slot.Courses[sci].Departments = append(slot.Courses[sci].Departments, course.Department)
-					slot.Courses[sci].Semesters = append(slot.Courses[sci].Semesters, course.Semesters...)
+					// Add only active codes and semesters to prevent showing codes/semesters with 0 students
+					slot.Courses[sci].CourseCodes = append(slot.Courses[sci].CourseCodes, activeCodes...)
+					slot.Courses[sci].Departments = append(slot.Courses[sci].Departments, activeDepartments...)
+					slot.Courses[sci].Semesters = append(slot.Courses[sci].Semesters, activeSemesters...)
 					slot.Courses[sci].StudentSets = append(slot.Courses[sci].StudentSets, course.StudentSet)
 					slot.Courses[sci].Strength += course.Strength
 					clubbed = true
@@ -535,28 +694,38 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 			}
 			if !clubbed {
 				slot.Courses = append(slot.Courses, SlotCourse{
-					CourseCodes: []string{course.CourseCode},
+					CourseCodes: activeCodes,
 					CourseName:  course.CourseName,
 					Strength:    course.Strength,
-					Departments: []string{course.Department},
-					Semesters:   course.Semesters,
+					Departments: activeDepartments,
+					Semesters:   activeSemesters,
 					StudentSets: []map[string]bool{course.StudentSet},
 					ClashSets:   []map[string]bool{course.ClashSet},
 					Type:        targetType,
 				})
 			}
 
-			(*scheduledMap)[course.CourseCode] = true
 			totalScheduled++
 			
-			// Commit state back (Dual-Category Logic)
-			if targetType == "Regular" {
-				// If we scheduled it as Regular, it's done for BOTH categories
-				regScheduled[course.CourseCode] = true
-				arrScheduled[course.CourseCode] = true
-			} else {
-				// If we scheduled it as Arrear, only Arrears are satisfied
-				arrScheduled[course.CourseCode] = true
+			// Commit course-code scheduling state
+			for code, baseSem := range course.CodeToSem {
+				if targetType == "Regular" {
+					if validSemSet[baseSem] {
+						regScheduled[code] = true
+						arrScheduled[code] = true
+					} else {
+						arrScheduled[code] = true
+					}
+				} else {
+					arrScheduled[code] = true
+				}
+			}
+			// Commit students placed in THIS course to perCourseScheduled
+			if perCourseScheduled[courseKey] == nil {
+				perCourseScheduled[courseKey] = make(map[string]bool)
+			}
+			for s := range dynRoster {
+				perCourseScheduled[courseKey][s] = true
 			}
 
 			// --- STANDALONE LOGIC ---
@@ -571,17 +740,17 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 				// To keep it simple and robust, we check if this department is still a leader.
 				curDeptCount := 0
 				for _, c := range pool {
-					if !(*scheduledMap)[c.CourseCode] && c.Department == course.Department {
+					if !isCourseScheduled(c, targetType, regScheduled, arrScheduled) && c.Department == course.Department {
 						curDeptCount++
 					}
 				}
 				// If this dept has more courses left than others, it's a leader.
 				isLeader := false
 				for _, c := range pool {
-					if !(*scheduledMap)[c.CourseCode] && c.Department != course.Department {
+					if !isCourseScheduled(c, targetType, regScheduled, arrScheduled) && c.Department != course.Department {
 						otherCount := 0
 						for _, c2 := range pool {
-							if !(*scheduledMap)[c2.CourseCode] && c2.Department == c.Department {
+							if !isCourseScheduled(c2, targetType, regScheduled, arrScheduled) && c2.Department == c.Department {
 								otherCount++
 							}
 						}
@@ -603,18 +772,15 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 		if config.Mode == 5 && config.ExtraSem > 0 && len(slot.Courses) == 0 {
 			// Try to fill from the correct pool (ExtraType)
 			var extraPool []CourseInfo
-			var extraScheduledMap *map[string]bool
 			if config.ExtraType == "Regular" {
 				extraPool = regCourses
-				extraScheduledMap = &regScheduled
 			} else {
 				extraPool = arrCourses
-				extraScheduledMap = &arrScheduled
 			}
 
 			for i := 0; i < len(extraPool); i++ {
 				course := extraPool[i]
-				if (*extraScheduledMap)[course.CourseCode] {
+				if isCourseScheduled(course, config.ExtraType, regScheduled, arrScheduled) {
 					continue
 				}
 				isExtra := false
@@ -628,6 +794,88 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 					continue
 				}
 
+				// -- DYNAMIC ROSTER RECONSTRUCTION --
+				dynRoster := make(map[string]bool)
+				extraCourseKey := strings.ToUpper(strings.TrimSpace(course.CourseName))
+				extraAlreadyIn := perCourseScheduled[extraCourseKey]
+				extraCodesMap := make(map[string]bool)
+
+				for code, baseSem := range course.CodeToSem {
+					codeContributed := false
+					if config.ExtraType == "Regular" {
+						if baseSem == config.ExtraSem {
+							if !regScheduled[code] {
+								for s := range course.CodeToGlobal[code] {
+									if extraAlreadyIn[s] { continue }
+									if nativeSem, isRegular := studentNativeSem[s]; isRegular {
+										if nativeSem != config.ExtraSem { continue }
+									}
+									dynRoster[s] = true
+									codeContributed = true
+								}
+							}
+						} else {
+							if !arrScheduled[code] {
+								for s := range course.CodeToArrear[code] {
+									if !extraAlreadyIn[s] { 
+										dynRoster[s] = true 
+										codeContributed = true
+									}
+								}
+							}
+						}
+					} else {
+						if !arrScheduled[code] {
+							for s := range course.CodeToArrear[code] {
+								if !extraAlreadyIn[s] { 
+									dynRoster[s] = true 
+									codeContributed = true
+								}
+							}
+						}
+					}
+					if codeContributed {
+						extraCodesMap[code] = true
+					}
+				}
+
+				if len(dynRoster) == 0 {
+					continue
+				}
+
+				var activeExtraCodes []string
+				extraSemMap := make(map[int]bool)
+				extraDeptMap := make(map[string]bool)
+				for code := range extraCodesMap {
+					activeExtraCodes = append(activeExtraCodes, code)
+					if sem, ok := course.CodeToSem[code]; ok {
+						extraSemMap[sem] = true
+					}
+					if dept, ok := course.CodeToDept[code]; ok {
+						for _, d := range strings.Split(dept, ",") {
+							extraDeptMap[strings.TrimSpace(d)] = true
+						}
+					}
+				}
+				
+				var activeExtraSemesters []int
+				for sem := range extraSemMap {
+					activeExtraSemesters = append(activeExtraSemesters, sem)
+				}
+				var activeExtraDepartments []string
+				for dept := range extraDeptMap {
+					activeExtraDepartments = append(activeExtraDepartments, dept)
+				}
+
+				if len(activeExtraCodes) == 0 {
+					activeExtraCodes = strings.Split(course.CourseCode, "+")
+					activeExtraSemesters = course.Semesters
+					activeExtraDepartments = strings.Split(course.Department, ", ")
+				}
+
+				course.StudentSet = dynRoster
+				course.Strength = len(dynRoster)
+
 				// Check for student clashes with already scheduled courses in this slot
 				if !canClubWith(course, slot.Courses) {
 					continue
@@ -637,9 +885,9 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 				clubbed := false
 				for sci := range slot.Courses {
 					if strings.EqualFold(slot.Courses[sci].CourseName, course.CourseName) {
-						slot.Courses[sci].CourseCodes = append(slot.Courses[sci].CourseCodes, course.CourseCode)
-						slot.Courses[sci].Departments = append(slot.Courses[sci].Departments, course.Department)
-						slot.Courses[sci].Semesters = append(slot.Courses[sci].Semesters, course.Semesters...)
+						slot.Courses[sci].CourseCodes = append(slot.Courses[sci].CourseCodes, activeExtraCodes...)
+						slot.Courses[sci].Departments = append(slot.Courses[sci].Departments, activeExtraDepartments...)
+						slot.Courses[sci].Semesters = append(slot.Courses[sci].Semesters, activeExtraSemesters...)
 						slot.Courses[sci].StudentSets = append(slot.Courses[sci].StudentSets, course.StudentSet)
 						slot.Courses[sci].Strength += course.Strength
 						clubbed = true
@@ -649,26 +897,38 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 
 				if !clubbed {
 					slot.Courses = append(slot.Courses, SlotCourse{
-						CourseCodes: []string{course.CourseCode},
+						CourseCodes: activeExtraCodes,
 						CourseName:  course.CourseName,
 						Strength:    course.Strength,
-						Departments: []string{course.Department},
-						Semesters:   course.Semesters,
+						Departments: activeExtraDepartments,
+						Semesters:   activeExtraSemesters,
 						StudentSets: []map[string]bool{course.StudentSet},
 						ClashSets:   []map[string]bool{course.ClashSet},
 						Type:        config.ExtraType,
 					})
 				}
 				
-				(*extraScheduledMap)[course.CourseCode] = true
 				totalScheduled++
 
-				// Commit state back (Dual-Category Logic)
-				if config.ExtraType == "Regular" {
-					regScheduled[course.CourseCode] = true
-					arrScheduled[course.CourseCode] = true
-				} else {
-					arrScheduled[course.CourseCode] = true
+				// Commit course-code state
+				for code, baseSem := range course.CodeToSem {
+					if config.ExtraType == "Regular" {
+						if baseSem == config.ExtraSem {
+							regScheduled[code] = true
+							arrScheduled[code] = true
+						} else {
+							arrScheduled[code] = true
+						}
+					} else {
+						arrScheduled[code] = true
+					}
+				}
+				// Commit students placed in THIS course
+				if perCourseScheduled[extraCourseKey] == nil {
+					perCourseScheduled[extraCourseKey] = make(map[string]bool)
+				}
+				for s := range dynRoster {
+					perCourseScheduled[extraCourseKey][s] = true
 				}
 			}
 		}
@@ -677,4 +937,17 @@ func Generate(db *sql.DB, regulationID int, config DayConfig, options SortOption
 	}
 
 	return result, nil
+}
+
+// isCourseScheduled evaluates if a merged course has been fully satisfied
+// based on each of its component codes individually.
+func isCourseScheduled(c CourseInfo, targetType string, regScheduled map[string]bool, arrScheduled map[string]bool) bool {
+	for code := range c.CodeToSem {
+		if targetType == "Regular" {
+			if !regScheduled[code] { return false }
+		} else {
+			if !arrScheduled[code] { return false }
+		}
+	}
+	return true
 }

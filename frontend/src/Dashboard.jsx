@@ -109,6 +109,7 @@ function SessionDetailsModal({ timetableId, day, period, onClose }) {
     s.name.toLowerCase().includes(search.toLowerCase()) ||
     s.roll.toLowerCase().includes(search.toLowerCase()) ||
     s.course_name.toLowerCase().includes(search.toLowerCase()) ||
+    (s.course_code && s.course_code.toLowerCase().includes(search.toLowerCase())) ||
     (s.type && s.type.toLowerCase().includes(search.toLowerCase()))
   );
 
@@ -610,16 +611,18 @@ export default function Dashboard({ timetableId, onApproved, onRejected, onViewC
               let items = [];
 
               if (mode === 1) {
-                items.push({ label: 'Daily', sems: (cfg.single || []) });
+                // All sessions are the same
+                items.push({ label: 'Daily', sems: (cfg.OddFN || []) });
               } else if (mode === 2) {
-                items.push({ label: 'Daily FN', sems: (cfg.splitFN || []) });
-                items.push({ label: 'Daily AN', sems: (cfg.splitAN || []) });
+                // All odd/even are the same, but FN/AN split
+                items.push({ label: 'Daily FN', sems: (cfg.OddFN || []) });
+                items.push({ label: 'Daily AN', sems: (cfg.OddAN || []) });
               } else {
                 // Mode 4 or 5
-                if(cfg.OddFN) items.push({ label: 'Odd FN', sems: cfg.OddFN });
-                if(cfg.OddAN) items.push({ label: 'Odd AN', sems: cfg.OddAN });
-                if(cfg.EvenFN) items.push({ label: 'Even FN', sems: cfg.EvenFN });
-                if(cfg.EvenAN) items.push({ label: 'Even AN', sems: cfg.EvenAN });
+                if(cfg.OddFN && cfg.OddFN.length > 0) items.push({ label: 'Odd FN', sems: cfg.OddFN });
+                if(cfg.OddAN && cfg.OddAN.length > 0) items.push({ label: 'Odd AN', sems: cfg.OddAN });
+                if(cfg.EvenFN && cfg.EvenFN.length > 0) items.push({ label: 'Even FN', sems: cfg.EvenFN });
+                if(cfg.EvenAN && cfg.EvenAN.length > 0) items.push({ label: 'Even AN', sems: cfg.EvenAN });
                 
                 if (mode === 5 && cfg.extra_sem) {
                   items.push({ label: 'Extra', sems: [cfg.extra_sem], isExtra: true });
@@ -638,7 +641,7 @@ export default function Dashboard({ timetableId, onApproved, onRejected, onViewC
                 }}>
                   <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)' }}>{item.label}:</span>
                   <span style={{ fontSize: 12, fontWeight: 800, color: item.isExtra ? 'var(--primary)' : 'var(--text-primary)' }}>
-                    S{item.sems.join(', S')}
+                    {item.sems.length > 0 ? `S${item.sems.join(', S')}` : 'None'}
                   </span>
                 </div>
               ));

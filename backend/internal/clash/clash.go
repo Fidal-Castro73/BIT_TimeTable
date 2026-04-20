@@ -27,6 +27,33 @@ func GetStudentSet(db *sql.DB, courseCode string, regulationID int, onlyArrear b
 	return set, nil
 }
 
+// GetStudentSetForUploadType returns students enrolled in a course filtered by
+// both upload_type AND semester. This creates a "pure" pool that prevents
+// students from a different semester or category leaking into a session roster.
+func GetStudentSetForUploadType(db *sql.DB, courseCode string, regulationID int, uploadType string, semester int) (map[string]bool, error) {
+	query := `SELECT DISTINCT register_no FROM student_data 
+		 WHERE course_code = ? AND regulation_id = ? AND upload_type = ?`
+	args := []interface{}{courseCode, regulationID, uploadType}
+	if semester > 0 {
+		query += " AND semester = ?"
+		args = append(args, semester)
+	}
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	set := make(map[string]bool)
+	for rows.Next() {
+		var reg string
+		if err := rows.Scan(&reg); err == nil {
+			set[reg] = true
+		}
+	}
+	return set, nil
+}
+
 // HasClash returns true if ANY student is enrolled in both courseA and courseB
 func HasClash(setA, setB map[string]bool) bool {
 	for reg := range setA {

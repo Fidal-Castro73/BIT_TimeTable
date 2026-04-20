@@ -96,9 +96,10 @@ func initDB() {
 		log.Fatal("Error creating timetable_slots table:", err)
 	}
 
-	// Dynamic Schema Update: Ensure 'semesters' column exists if the table was created previously
+	// Dynamic Schema Update: Ensure columns exist if the table was created previously
 	db.Exec("ALTER TABLE timetable_slots ADD COLUMN semesters TEXT AFTER departments")
 	db.Exec("ALTER TABLE timetable_slots ADD COLUMN session_type VARCHAR(50) AFTER semesters")
+	db.Exec("ALTER TABLE timetable_slots ADD COLUMN student_rolls JSON AFTER session_type")
 
 	// 11. Database Deep Scrub (One-time Migration)
 	// Optimized: Only run on rows that actually need cleaning to save time on startup
@@ -454,8 +455,21 @@ func generateHandler(c *gin.Context) {
 			}
 			sems := strings.Join(semBatch, ",")
 
-			_, err = db.Exec(`INSERT INTO timetable_slots (timetable_id, day_number, session, course_codes, course_name, strength, departments, semesters, session_type) VALUES (?,?,?,?,?,?,?,?,?)`,
-				timetableID, slot.DayNumber, slot.Session, codes, sc.CourseName, sc.Strength, depts, sems, sc.Type)
+			// Extract flat list of unique student rolls assigned by the dynamic roster reconstructor
+			var rollList []string
+			rollMap := make(map[string]bool)
+			for _, m := range sc.StudentSets {
+				for roll := range m {
+					if !rollMap[roll] {
+						rollMap[roll] = true
+						rollList = append(rollList, roll)
+					}
+				}
+			}
+			rollsJSON, _ := json.Marshal(rollList)
+
+			_, err = db.Exec(`INSERT INTO timetable_slots (timetable_id, day_number, session, course_codes, course_name, strength, departments, semesters, session_type, student_rolls) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+				timetableID, slot.DayNumber, slot.Session, codes, sc.CourseName, sc.Strength, depts, sems, sc.Type, string(rollsJSON))
 			if err != nil {
 				log.Println("Slot insert error:", err)
 			}
@@ -974,16 +988,33 @@ func getSessionStudentsHandler(c *gin.Context) {
 	// 1. Get Timetable Metadata
 	var regID int
 	var ut string
-	err := db.QueryRow(`SELECT regulation_id, upload_type FROM timetables WHERE id=?`, id).Scan(&regID, &ut)
+	var dayConfigJSON string
+	err := db.QueryRow(`SELECT regulation_id, upload_type, day_config FROM timetables WHERE id=?`, id).Scan(&regID, &ut, &dayConfigJSON)
 	if err != nil {
 		fmt.Printf("❌ Error: Timetable %s not found in DB\n", id)
 		c.JSON(http.StatusNotFound, gin.H{"error": "Timetable not found"})
 		return
 	}
 
-	// 2. Get Courses for this session
+	var config engine.DayConfig
+	json.Unmarshal([]byte(dayConfigJSON), &config)
+
+	// Compute validSemesters for the current slot
+	var validSemesters []int
+	dayInt, _ := strconv.Atoi(day)
+	isOdd := (dayInt % 2) != 0
+	if isOdd {
+		if period == "FN" { validSemesters = config.OddFN } else { validSemesters = config.OddAN }
+	} else {
+		if period == "FN" { validSemesters = config.EvenFN } else { validSemesters = config.EvenAN }
+	}
+	if len(validSemesters) == 0 && config.Mode == 5 {
+		validSemesters = []int{config.ExtraSem}
+	}
+
+	// 2. Get Courses and EXACT Roster for this session
 	rows, err := db.Query(`
-		SELECT course_codes, session_type FROM timetable_slots 
+		SELECT course_codes, session_type, student_rolls FROM timetable_slots 
 		WHERE timetable_id = ? AND day_number = ? AND session = ?
 	`, id, day, period)
 	if err != nil {
@@ -993,11 +1024,21 @@ func getSessionStudentsHandler(c *gin.Context) {
 	defer rows.Close()
 
 	var allCodes []string
+	var exactRolls []string
 	var sessionType string
 	for rows.Next() {
 		var codes, sType string
-		rows.Scan(&codes, &sType)
+		var rollsJSON sql.NullString
+		rows.Scan(&codes, &sType, &rollsJSON)
 		sessionType = sType
+		
+		if rollsJSON.Valid && rollsJSON.String != "" {
+			var rolls []string
+			if err := json.Unmarshal([]byte(rollsJSON.String), &rolls); err == nil {
+				exactRolls = append(exactRolls, rolls...)
+			}
+		}
+
 		if codes != "" {
 			parts := strings.Split(codes, ",")
 			for _, p := range parts {
@@ -1011,42 +1052,60 @@ func getSessionStudentsHandler(c *gin.Context) {
 
 	fmt.Printf("🔍 Session Details: Timetable=%s, Day=%s, Sess=%s | Reg=%d, Type=%s | Codes=%v\n", id, day, period, regID, ut, allCodes)
 
-	// Diagnostic: How many students exist for this regulation overall?
-	var totalInReg int
-	db.QueryRow("SELECT COUNT(*) FROM student_data WHERE regulation_id = ? AND upload_type = ?", regID, ut).Scan(&totalInReg)
-	fmt.Printf("📊 Diagnostic: Total students in DB for Reg %d (%s) = %d\n", regID, ut, totalInReg)
-
 	if len(allCodes) == 0 {
 		c.JSON(http.StatusOK, gin.H{"success": true, "students": []interface{}{}})
 		return
 	}
 
-	// 3. Fetch Students with robust matching
-	placeholders := make([]string, len(allCodes))
+	// 3. Fetch Students using EXACT roster mapping
 	args := []interface{}{regID}
-	for i, code := range allCodes {
-		placeholders[i] = "?"
-		args = append(args, code)
-	}
-
 	queryStr := `
 		SELECT student_name, register_no, course_code, course_name, department, upload_type
 		FROM student_data 
 		WHERE regulation_id = ? 
 	`
 
-	if sessionType == "Arrear" {
-		queryStr += " AND upload_type = 'Arrear' "
+	if len(exactRolls) > 0 {
+		rollPlaceholders := make([]string, len(exactRolls))
+		for i, roll := range exactRolls {
+			rollPlaceholders[i] = "?"
+			args = append(args, roll)
+		}
+		queryStr += ` AND register_no IN (` + strings.Join(rollPlaceholders, ",") + `)`
+	} else {
+		// Fallback for older databases without student_rolls
+		if sessionType == "Arrear" {
+			queryStr += " AND upload_type = 'Arrear' "
+		} else if sessionType == "Regular" {
+			semStrs := []string{}
+			for _, s := range validSemesters {
+				semStrs = append(semStrs, strconv.Itoa(s))
+			}
+			if len(semStrs) > 0 {
+				queryStr += fmt.Sprintf(" AND (upload_type = 'Arrear' OR (upload_type = 'Regular' AND semester IN (%s))) ", strings.Join(semStrs, ","))
+			} else {
+				queryStr += " AND upload_type = 'Arrear' "
+			}
+		}
 	}
 
-	queryStr += fmt.Sprintf(`
-		  AND (
-			TRIM(UPPER(course_code)) IN (%s)
-			OR TRIM(REPLACE(UPPER(course_code), '-', '')) IN (%s)
-		  )
-		ORDER BY register_no`, strings.Join(placeholders, ","), strings.Join(placeholders, ","))
+	codePlaceholders := make([]string, len(allCodes))
+	for i, code := range allCodes {
+		codePlaceholders[i] = "?"
+		args = append(args, code)
+	}
 
-	studentRows, err := db.Query(queryStr, append(args, args[1:]...)...)
+	queryStr += ` AND (TRIM(UPPER(course_code)) IN (` + strings.Join(codePlaceholders, ",") + `)`
+	queryStr += ` OR TRIM(REPLACE(UPPER(course_code), '-', '')) IN (` + strings.Join(codePlaceholders, ",") + `))`
+	
+	// Must append codes again for the OR clause
+	for _, code := range allCodes {
+		args = append(args, code)
+	}
+
+	queryStr += ` ORDER BY register_no`
+
+	studentRows, err := db.Query(queryStr, args...)
 	if err != nil {
 		fmt.Printf("❌ SQL Query Error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Query failed"})
